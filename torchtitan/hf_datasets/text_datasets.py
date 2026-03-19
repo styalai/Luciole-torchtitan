@@ -4,13 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable
 
 import torch
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, load_from_disk
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
@@ -22,32 +21,60 @@ from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
 
-def _load_c4_dataset(dataset_path: str, split: str):
-    """Load C4 dataset with default configuration."""
-    return load_dataset(dataset_path, name="en", split=split, streaming=True)
+def _load_synth_dataset(dataset_path: str, split: str):
+    synth = load_dataset(dataset_path, split=split, streaming=True)
+    synth = synth.filter(lambda sample: sample["language"] == "en")
+    return synth
 
+def _process_synth_dataset(sample: dict[str, Any]) -> str:
+    return sample["synthetic_answer"]
 
-def _process_c4_text(sample: dict[str, Any]) -> str:
-    """Process C4 dataset sample text."""
+def _load_ffe_dataset(dataset_path: str, split: str):
+    synth = load_dataset(dataset_path, split=split, streaming=True)
+    #synth = synth.filter(lambda sample: sample["language"] == "en")
+    return synth
+
+def _process_ffe_dataset(sample: dict[str, Any]) -> str:
     return sample["text"]
 
+def _load_dataset(dataset_path: str, split: str):
+    d = load_dataset(dataset_path, split=split, streaming=True)
+    return d
+
+def _process_dataset(sample: dict[str, Any]) -> str:
+    return sample["text"]
 
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
-    "c4": DatasetConfig(
-        path="allenai/c4",
-        loader=partial(_load_c4_dataset, split="train"),
-        sample_processor=_process_c4_text,
+    "synth": DatasetConfig(
+        path="synth",
+        loader=partial(_load_synth_dataset, split="train"),
+        sample_processor=_process_synth_dataset,
     ),
-    "c4_test": DatasetConfig(
-        path="tests/assets/c4_test",
-        loader=lambda path: load_dataset(path, split="train"),
-        sample_processor=_process_c4_text,
+    "synth_validation": DatasetConfig(
+        path="synth_validation",
+        loader=partial(_load_synth_dataset, split="train"),
+        sample_processor=_process_synth_dataset,
     ),
-    "c4_validation": DatasetConfig(
-        path="allenai/c4",
-        loader=partial(_load_c4_dataset, split="validation"),
-        sample_processor=_process_c4_text,
+    "filtered-fineweb-edu": DatasetConfig(
+        path="ffe",
+        loader=partial(_load_ffe_dataset, split="train"),
+        sample_processor=_process_ffe_dataset,
+    ),
+    "filtered-fineweb-edu_validation": DatasetConfig(
+        path="ffe_validation",
+        loader=partial(_load_ffe_dataset, split="train"),
+        sample_processor=_process_ffe_dataset,
+    ),
+    "ludata":DatasetConfig(
+        path="ludata",
+        loader=partial(_load_dataset, split="train"),
+        sample_processor=_process_dataset,
+    ),
+    "ludata_validation":DatasetConfig(
+        path="ludata_validation",
+        loader=partial(_load_dataset, split="train"),
+        sample_processor=_process_dataset,
     ),
 }
 
@@ -154,7 +181,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
             self._data.load_state_dict(state_dict["data"])
 
     def state_dict(self):
-        _state_dict: dict[str, Any] = {"token_buffer": self._token_buffer}
+        _state_dict = {"token_buffer": self._token_buffer}
 
         if isinstance(self._data, Dataset):
             _state_dict["sample_idx"] = self._sample_idx
@@ -173,15 +200,7 @@ def build_text_dataloader(
     job_config: JobConfig,
     infinite: bool = True,
 ) -> ParallelAwareDataloader:
-    """Build a data loader for HuggingFace datasets.
-
-    Args:
-        dp_world_size: Data parallelism world size.
-        dp_rank: Data parallelism rank.
-        tokenizer: Tokenizer to use for encoding text.
-        job_config: Job configuration containing dataset and DataLoader settings.
-        infinite: Whether to loop the dataset infinitely.
-    """
+    """Build a data loader for HuggingFace datasets."""
     dataset_name = job_config.training.dataset
     dataset_path = job_config.training.dataset_path
     batch_size = job_config.training.local_batch_size
@@ -197,16 +216,11 @@ def build_text_dataloader(
         infinite=infinite,
     )
 
-    dataloader_kwargs = {
-        **asdict(job_config.training.dataloader),
-        "batch_size": batch_size,
-    }
-
     return ParallelAwareDataloader(
-        hf_ds,
+        dataset=hf_ds,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-        **dataloader_kwargs,
+        batch_size=batch_size,
     )
 
 
@@ -217,15 +231,7 @@ def build_text_validation_dataloader(
     job_config: JobConfig,
     infinite: bool = False,
 ) -> ParallelAwareDataloader:
-    """Build a validation data loader for HuggingFace datasets.
-
-    Args:
-        dp_world_size: Data parallelism world size.
-        dp_rank: Data parallelism rank.
-        tokenizer: Tokenizer to use for encoding text.
-        job_config: Job configuration containing dataset and DataLoader settings.
-        infinite: Whether to loop the dataset infinitely.
-    """
+    """Build a validation data loader for HuggingFace datasets."""
     dataset_name = job_config.validation.dataset
     dataset_path = job_config.validation.dataset_path
     batch_size = job_config.validation.local_batch_size
@@ -241,14 +247,9 @@ def build_text_validation_dataloader(
         infinite=infinite,
     )
 
-    dataloader_kwargs = {
-        **asdict(job_config.validation.dataloader),
-        "batch_size": batch_size,
-    }
-
     return ParallelAwareDataloader(
-        hf_ds,
+        dataset=hf_ds,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-        **dataloader_kwargs,
+        batch_size=batch_size,
     )
